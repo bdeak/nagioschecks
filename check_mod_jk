@@ -1,0 +1,263 @@
+#! /usr/bin/perl -w
+# nagios: -epn
+###################################################################
+# Check Mod JK using the /jkstatus?mime=xml status page, with providing performance data also.
+# Parses the jkstatus page as XML to get the necessary data.
+#
+# Example: 
+# ./check_mod_jk -U http://example.com//admin/jkstatus
+# ./check_mod_jk -U http://example.com//admin/jkstatus --threshold used_percent=70:90 --threshold workers_not_ok_percent=10:50
+###################################################################
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Basename;
+use LWP::UserAgent;
+use HTML::TreeBuilder;
+use XML::XPath;
+
+my %ERRORS;
+$ERRORS{"OK"} = 0;
+$ERRORS{"WARNING"} = 1;
+$ERRORS{"CRITICAL"} = 2;
+$ERRORS{"UNKNOWN"} = 3;
+
+my $NAME = "CHECK_MOD_JK";
+my $timeout = 10;
+
+sub print_help ();
+sub print_usage ();
+
+my ($url, $help, $username, $password, $type, %provided_thresholds);
+
+my $PROGNAME=basename($0);
+
+$url = "";
+
+Getopt::Long::Configure("no_ignore_case");
+GetOptions(
+	"h"   => \$help, "help"	=> \$help,
+	"U=s" => \$url, "url"	=> \$url,
+    "u=s" => \$username, "username=s" => \$username,
+    "p=s" => \$password, "password=s" => \$password,
+    "t=s" => \$timeout, "timeout=s" => \$timeout,
+                        "threshold=s" => \%provided_thresholds,
+
+);
+
+if (scalar keys(%provided_thresholds) == 0) {
+    # provide some defaults so if the script is called without thresholds it still functions
+    $provided_thresholds{workers_not_ok} = "1";
+    $provided_thresholds{workers_not_ok_percent} = "10:50";
+    $provided_thresholds{workers_not_active_percent} = "75:95";
+}
+
+if ($help) {
+	print_usage();
+	exit $ERRORS{'OK'};
+}
+
+$url = shift unless ($url);
+
+if (! $url) {
+    &print_usage();
+	exit $ERRORS{'UNKNOWN'};
+}
+
+if ((defined($username) && (!defined($password))) || ((!defined($username) && (defined($password))))) {
+    print "$NAME UNKNOWN: Both username and password have to be provided!\n";
+    exit $ERRORS{"UNKNOWN"};
+}
+
+unless ($url =~ /\?mime=xml$/) {
+    $url = $url . "?mime=xml";
+}
+
+# do a HTTP request to the URL provided
+
+my $ua = LWP::UserAgent->new();
+$ua->timeout($timeout);
+my $request = HTTP::Request->new(GET => $url);
+if ($username && $password) {
+    $request->authorization_basic($username, $password);
+}
+my $response = $ua->request($request);
+unless ($response->is_success) {
+    print "$NAME CRITICAL: The HTTP GET request to $url has failed with: " . $response->status_line . "\n";
+    exit $ERRORS{'CRITICAL'};
+}
+my $xpath_expression = XML::XPath->new(xml => $response->decoded_content);
+# check if there is exactly one balancer set up
+if ($xpath_expression->find('//jk:status/jk:balancers/@count')->to_literal eq "0") {
+    print "$NAME UNKNOWN: There are no balancers set up on '$url'!\n";
+    exit $ERRORS{"UNKNOWN"};
+} elsif ($xpath_expression->find('//jk:status/jk:balancers/@count')->to_literal ne "1") {
+    print "$NAME UNKNOWN: There are more than one balancers set up on '$url'!\n";
+    exit $ERRORS{"UNKNOWN"};
+}
+# all good
+# get the general statistics
+my %values;
+my %metrics;
+my %thresholds;
+my %units;
+
+my @base_metrics = qw( member_count good degraded bad busy last_reset_ago );
+for my $base_metric (@base_metrics) {
+    # need to convert the literal object to an integer
+    if ($xpath_expression->find("//jk:status/jk:balancers/jk:balancer/\@$base_metric")->to_literal() ne "") {
+        $values{$base_metric} = int($xpath_expression->find("//jk:status/jk:balancers/jk:balancer/\@$base_metric")->to_literal());
+    }
+}
+# create a derived metric that shows the percent of the used workers compared to max-bad
+if ($values{member_count} - $values{bad} - $values{degraded} != 0) {
+    $values{used_percent} = $values{busy} / ($values{member_count} - $values{bad} - $values{degraded}) * 100;
+} else {
+    # no workers used currently, do this to avoid division by zero
+    $values{used_percent} = 0;
+}
+
+# get the per member information
+# look for members that are ACT/!OK
+#
+my $nodeset = $xpath_expression->find('//jk:status/jk:balancers/jk:balancer/jk:member[@activation="ACT"]/@state');
+my @nodes = $nodeset->get_nodelist;
+my $not_ok_counter = 0;
+for my $node (@nodes) {
+    if ($node->string_value !~ /^OK/) {
+        $not_ok_counter++;
+    }
+}
+# save the number of not ok entries
+$values{workers_not_ok} = $not_ok_counter;
+if ($values{member_count} - $values{bad} - $values{degraded} != 0) {
+    $values{workers_not_ok_percent} = $not_ok_counter / ($values{member_count} - $values{bad} - $values{degraded}) * 100;
+} else {
+    $values{workers_not_ok_percent} = 0;  
+}
+
+
+# get the number of not active nodes as a number and as a percentage
+$nodeset = $xpath_expression->find('//jk:status/jk:balancers/jk:balancer/jk:member[not(@activation="ACT")]/@state');
+@nodes = $nodeset->get_nodelist;
+my $not_act_counter = 0;
+for my $node (@nodes) {
+	$not_act_counter++;
+}
+
+$values{workers_not_active} = $not_act_counter;
+$values{workers_not_active_percent} = $not_act_counter * 100 / $values{member_count};
+
+# check critical and warning values, assemble performance data
+my $perfdata = "";
+foreach my $metric (sort(keys(%values))) {
+    my ($ref_thresholds) = &check_thresholds($metric, $values{$metric}, \%thresholds, \%provided_thresholds);
+    %thresholds = %{$ref_thresholds};
+    if ($metric =~ /percent/) {
+        $perfdata .= sprintf ("%s=%0.2f%%;%s;%s;0;100 ", $metric, $values{$metric}, $thresholds{$metric}->{warning} ? $thresholds{$metric}->{warning} : "", $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "");
+        $units{$metric} = "%";
+    } elsif ($metric =~ /ago$/) {
+        $perfdata .= sprintf ("%s=%0.2fs;%s;%s ", $metric, $values{$metric}, $thresholds{$metric}->{warning} ? $thresholds{$metric}->{warning} : "", $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "");
+        $units{$metric} = "s";
+    } else {
+        $perfdata .= sprintf ("%s=%0.2f;%s;%s ", $metric, $values{$metric}, $thresholds{$metric}->{warning} ? $thresholds{$metric}->{warning} : "", $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "");
+    }
+}
+
+my %warnings;
+my %criticals;
+foreach my $metric (sort(keys(%thresholds))) {
+    if ($thresholds{$metric}->{is_warning}) {
+            $warnings{$metric} = $thresholds{$metric}->{warning};
+    }
+    if ($thresholds{$metric}->{is_critical}) {
+            $criticals{$metric} = $thresholds{$metric}->{critical};
+    }
+}
+
+my $state_name;
+my $message;
+if (scalar keys(%criticals) > 0) {
+    $state_name = "CRITICAL";
+    $message = "$NAME: $state_name: The following metrics are in critical state:";
+    foreach my $metric (keys(%criticals)) {
+        $message .= sprintf (" %s=%0.2f%s (w:%s c:%s),", lc($metric), $values{$metric}, $units{$metric} ? $units{$metric} : "", $thresholds{$metric}->{warning}, $thresholds{$metric}->{critical});
+    }
+    # remove trailing comma
+    chop ($message);
+} elsif (scalar keys(%warnings) > 0) {
+    $state_name = "WARNING";
+    $message = "$NAME: $state_name: The following metrics are in warning state:";
+    foreach my $metric (keys(%warnings)) {
+        $message .= sprintf (" %s=%0.2f%s (w:%s c:%s),", lc($metric),$values{$metric}, $units{$metric} ? $units{$metric} : "", $thresholds{$metric}->{warning}, $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "N/A");
+    }
+    chop ($message);
+} else {
+    $state_name = "OK";
+    $message = "$NAME $state_name: All metrics are ok.";
+}
+my $state = $ERRORS{$state_name};
+&print_status_and_exit ($state_name, $state, $message, $perfdata);
+
+
+###################################################################################################
+# Subroutines
+###################################################################################################
+
+
+sub print_status_and_exit ($$$$) {
+    my $state_name = shift;
+    my $state = shift;
+    my $message = shift;
+    my $perfdata = shift;
+    print ("$message | $perfdata\n");
+    exit $state;
+}
+
+sub check_thresholds ($$$$$) {
+    my $metric = shift;
+    my $value = shift;
+    my $ref_thresholds = shift;
+    my $ref_provided_thresholds = shift;
+    my %thresholds = %{$ref_thresholds};
+    my %provided_thresholds = %{$ref_provided_thresholds};
+    # use the threshold levels provided via the command line 
+    my @th;
+    if (defined $provided_thresholds{lc($metric)} && $provided_thresholds{lc($metric)}) {
+        # split up the string to warning and critical thresholds
+        @th = split(/[:,]/, $provided_thresholds{lc($metric)});
+    } elsif (defined $provided_thresholds{uc($metric)} && $provided_thresholds{uc($metric)}) {
+        @th = split(/[:,]/, $provided_thresholds{uc($metric)});
+    }
+    my ($warning, $critical);
+    if (scalar @th) {
+            $warning = $th[0];
+        if ($th[1]) {
+            $critical = $th[1];
+        }
+    }
+    if (defined $warning) {
+        $thresholds{$metric}->{warning} = $warning;
+        if (defined $critical && ($value < $critical) && ($value > $warning)) {
+            $thresholds{$metric}->{is_warning} = 1;
+        } elsif ($value > $warning) {
+            $thresholds{$metric}->{is_warning} = 1;
+        }
+    }
+    if (defined $critical) {
+        $thresholds{$metric}->{critical} = $critical;
+        if ($value > $critical) {
+            $thresholds{$metric}->{is_critical} = 1;
+        }
+    }
+    return \%thresholds;
+}
+
+sub print_usage () {
+	print "Usage: $PROGNAME <-U url_of_jk_status_page> [-u|--username username -p|--password password] [-h] [-t timeout] [--threshold metric1=warning1:critical1 --threshold metric2=warning2 ...]\n\n";
+    print "Example:\n";
+    print " $PROGNAME -U http://example.com//admin/jkstatus\n";
+    print " $PROGNAME -U http://example.com//admin/jkstatus --threshold used_percent=70:90 --threshold workers_not_ok_percent=10:50\n";
+}
+

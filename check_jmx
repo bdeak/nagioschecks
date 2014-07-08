@@ -1,0 +1,1004 @@
+#!/usr/bin/env perl
+###############################################################################################################
+# This script implements a nagios check using jmx4perl bindings to get jmx data from a jolokia enabled java service.
+# The script is highly flexible, and provides performance data as well.
+#
+###############################################################################################################
+# Configuration Details
+###############################################################################################################
+# HIERARCHY
+#
+# The mbeans that are checked are grouped into so called services. Each service is a group of mbeans to be checked
+# like 'memory', 'threads', etc.
+# For each of these services you can specify any number of:
+#   * Mbean aliases provided by JMX4Perl (there are a bunch of default aliases for the most basic MBeans provided by JMX4Perl), 
+#       (for the list of available Aliases see http://search.cpan.org/~roland/jmx4perl/lib/JMX/Jmx4Perl/Alias.pm)
+#   * Fully qualified Mbean names/attributes/paths 
+#   * Extra metrics that are derived from two or more of the two above
+#
+# The definition of the service groups and their target metrics is done using the %services hash. Each such metric
+# must at least have an operation and a unit subkey, but can also have additional keys if needed.
+#
+# DEFINING SERVICES AND METRICS
+#
+# Defining an MBean using an ALIAS:
+# $services{memory}->{base_metrics}->{MEMORY_HEAP_USED}->{operation} = "/ 1024 / 1024";
+# $services{memory}->{base_metrics}->{MEMORY_HEAP_USED}->{unit} = "Mb";
+#
+# Defining an MBean using a fully qualified MBean name
+# $services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{mbean} = "java.lang:name=ParNew,type=GarbageCollector";
+# $services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{attribute} = "LastGcInfo";
+# $services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{path} = "memoryUsageBeforeGc/Par Survivor Space/used";
+# $services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{operation} = "";
+# $services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{unit} = "b";
+#
+# Here the MBean Alias can be anything, but later on the name of the performance value will be printed based on this name.
+#
+# Defining extra metrics derived from Aliases and normal MBeans
+# $services{memory}->{extra_metrics}->{USED_HEAP_PERCENT}->{expression} = "MEMORY_HEAP_USED / MEMORY_HEAP_MAX * 100";
+# $services{memory}->{extra_metrics}->{USED_HEAP_PERCENT}->{operation} = "";
+# $services{memory}->{extra_metrics}->{USED_HEAP_PERCENT}->{unit} = "%";
+#
+# The alias name here can also be anything, same as with normal MBeans.
+#
+# EXTRA POSSIBILITIES WITH SERVICES AND METRICS
+# The definition of each metric is flexible and allows room for creativity 
+#
+# Operaton
+# The operation key defines an operation that will be executed on the given metric after the data has been retrieved
+# from Jolokia. It can be left empty if no operation is required, or can be used to divide the result by any number, or do
+# any other arithmetic operation on it. Default use is to convert result bytes to megabytes for example.
+#
+# Unit
+# Unit is used only for the performance data, and is a helper for Icinga and PNP4Nagios to create the proper type of rrd 
+# database file for the given metric. It's values can be the ones accepted by Icinga and PNP4Nagios:
+#   %: the metric is a percent
+#   c: the metric is an ever growing counter - important so rrd will be created with the type derive, must be used where a ratio
+#       needs to be counted by rrd (interface traffic)
+#   b,kb,Mb: self explanatory
+#   ms,s: millisecond, second
+#   Unit can also be left empty if the given metric is a simple number (number of logged in users)
+#   For details, see http://docs.icinga.org/latest/en/perfdata.html#formatperfdata
+#
+# Parameters
+# Parameter substitution is possible inside the Mbean definitions which can be used to use a generic pattern in the 
+# MBean definition and specify the value for the parameter runtime using command line parameters.
+# Example:
+# $services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{mbean} = "Catalina:context=%PARAM1%,host=%PARAM2%,type=Manager";
+# $services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{attribute} = "activeSessions";
+# $services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{path} = "";
+# $services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{operation} = "";
+# $services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{unit} = "";
+#
+# During evaluation of the Mbean names just before the value is requested from Jolokia the script substitutes these placeholders with the
+# specific values provided using the command line. The command line argument '--param value' can be used to specify these parameters. 
+# The '--param' argument can be provided multiple times, and the order of the parameters is preserved when substituting the parameter.
+# Example for providing such parameters:
+# ./check_jmx -j http://example.com:8080/jolokia/ -u jolokia_user -p jolokia_password -s tomcat_sessions --param /app_context --param localhost
+#
+# Search Patterns
+# It is also possible to use a search pattern instead of a specific MBean name in the metric configuration. To specify a pattern you need to prepend
+# the Mbean name with 'P='. The pattern is a simple globbing pattern, NOT A REGEX! The pattern also allows to use the regex-like notation of 
+# OR relation with (..|..). Any number of patterns can be provided this way, the first matching mbean will be used. If a pattern selects multiple
+# MBeans, an error will be thrown.
+# Example:
+# $services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_MAX}->{mbean} = "P=java.lang:name=*Survivor Space,type=MemoryPool";
+# $services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_USED}->{mbean} = "P=(java.lang:name=*Old Gen,type=MemoryPool|java.lang:name=Tenured Gen,type=MemoryPool)";
+#
+# The search patterns are also usable for path expressions. If a pattern is given, it must be specific enough that it only matches one path in the result
+# Example:
+# $services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{path} = 'P=^(memoryUsageBeforeGc/Par Survivor Space/used|memoryUsageBeforeGc/PS Survivor Space/used)$';
+# or: (no pattern)
+# $services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{path} = 'memoryUsageBeforeGc/Par Survivor Space/used';
+# 
+# Historical values
+# With extra_metrics values from the previous run can be used using the H=<METRIC_NAME> notation. In every run the previous values are saved to a file, and on every
+# run these values are available to be referenced using 'H=METRIC'. The 'macro' H=DURATION is also available which will hold the number of seconds that has passed
+# since the last measurement was done.
+# This can be used to work with metrics that are counters, that is, which only raise their values on every read. With this method the growth since the last measurement
+# can be measured and alerted upon
+# Example: measuring the time spent with GC since the last measurement
+# (the reason for the double division is that grouping with parentheses is not (yet?) supported)
+# $services{gc}->{extra_metrics}->{GC_TENURED_COLLECTIONTIME_NUMERICAL}->{expression} = "GC_TENURED_COLLECTIONTIME / H=DURATION - H=GC_TENURED_COLLECTIONTIME / H=DURATION";
+# $services{gc}->{extra_metrics}->{GC_TENURED_COLLECTIONTIME_NUMERICAL}->{operation} = "";
+# $services{gc}->{extra_metrics}->{GC_TENURED_COLLECTIONTIME_NUMERICAL}->{unit} = "ms";
+##
+# Hardcoded Thresholds (not recommended)
+# You can provide warning and critical thresholds for each metric hardcoded in the configuration, however it's not recommended due to the hardcoded nature of the
+# threshold. However this method may be used to define a default threshold, which can later be overridden using the command line '--threshold' argument.
+# Example:
+# $services{tomcat_threads}->{extra_metrics}->{TOMCAT_THREADS_BUSY_PERCENT}->{expression} = "TOMCAT_THREADS_BUSY * 100 / TOMCAT_THREADS_MAX";
+# $services{tomcat_threads}->{extra_metrics}->{TOMCAT_THREADS_BUSY_PERCENT}->{operation} = "";
+# $services{tomcat_threads}->{extra_metrics}->{TOMCAT_THREADS_BUSY_PERCENT}->{unit} = "%";
+# $services{tomcat_threads}->{extra_metrics}->{TOMCAT_THREADS_BUSY_PERCENT}->{warning} = "80";
+# $services{tomcat_threads}->{extra_metrics}->{TOMCAT_THREADS_BUSY_PERCENT}->{critical} = "95";
+#
+# This would result in a warning to be triggered if the derived metric of the busy tomcat threads is above 80%.
+# To override this threshold, or to provide a threshold to a metric that doesn't have a default value, 
+# the '--threshold metric_name=warnlevel[:critlevel]' argument can be used. This argument can be used multiple times, the 'metric_name' is the lowercase
+# name of any metric that has been defined in the %services hash.
+# If the critical value is not provided, the given metric will never result in a critical state, the value will only be checked against the warning threshold.
+# Example:
+# ./check_jmx -j http://example.com:8080/jolokia/ -u jolokia_user -p jolokia_password -s tomcat_threads --param 192.168.1.101 --param 8081 --threshold tomcat_threads_current=200:400 --threshold tomcat_used_threads_percent=2:40
+# ./check_jmx -j http://example.com:8080/jolokia/ -u jolokia_user -p jolokia_password -s tomcat_threads --param 192.168.1.101 --param 8081 --threshold tomcat_threads_current=200:400 --threshold tomcat_used_threads_percent=2
+#
+# Note: The script only supports the 'read' JMX operation.
+#
+# Required modules
+# JMX::Jmx4Perl - libjmx4perl-perl (custom built)
+# JMX::Jmx4Perl::Alias - libjmx4perl-perl (custom built)
+# Hash::Flatten - libhash-flatten-perl
+###############################################################################################################
+# Only touch the $services definitions below this line
+###############################################################################################################
+use strict;
+use warnings;
+use Getopt::Long;
+use JMX::Jmx4Perl;
+use JMX::Jmx4Perl::Alias;
+use Hash::Flatten qw(:all);
+use Data::Dumper;
+
+my %services;
+
+my $user = "jolokia_user";
+my $password = "jolokia_password";
+my $historical_data_file_pattern = "/tmp/check_jmx_%SERVICE%_%JOLOKIA_URL%.dat";
+# define service groups that will be checked (memory, threads, etc)
+# for each service the key is the service name, the values are the aliases known by jmx4perl
+# for details on the alias names, see http://search.cpan.org/~roland/jmx4perl-1.07/lib/JMX/Jmx4Perl/Alias.pm
+# or call this script with '-A whatever', and it will list all available arguments
+# memory heap metrics
+#######################################################################################
+# Memory metrics
+$services{memory}->{base_metrics}->{MEMORY_HEAP_USED}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_metrics}->{MEMORY_HEAP_USED}->{unit} = "Mb";
+
+$services{memory}->{base_metrics}->{MEMORY_HEAP_MAX}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_metrics}->{MEMORY_HEAP_MAX}->{unit} = "Mb";
+
+# memory nonheap metrics
+$services{memory}->{base_metrics}->{MEMORY_NONHEAP_USED}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_metrics}->{MEMORY_NONHEAP_USED}->{unit} = "Mb";
+
+$services{memory}->{base_metrics}->{MEMORY_NONHEAP_MAX}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_metrics}->{MEMORY_NONHEAP_MAX}->{unit} = "Mb";
+
+# Metrics that doesn't have an ALIAS, these are defined with their fully qualified MBEAN names/attributes/paths
+
+# memory eden metrics
+# because of the different GC settings the memory pools can be accessed under different names with different configurations:
+#
+# java.lang:name=Par Eden Space,type=MemoryPool
+# java.lang:name=Par Survivor Space,type=MemoryPool
+# java.lang:name=CMS Old Gen,type=MemoryPool
+# java.lang:name=CMS Perm Gen,type=MemoryPool
+#
+# On the other machines (where no parallel GC is set:
+# java.lang:name=PS Eden Space,type=MemoryPool
+# java.lang:name=PS Survivor Space,type=MemoryPool
+# java.lang:name=PS Old Gen,type=MemoryPool
+# java.lang:name=PS Perm Gen,type=MemoryPool
+#
+# java.lang:name=Code Cache,type=MemoryPool
+# java.lang:name=Tenured Gen,type=MemoryPool
+# java.lang:name=Perm Gen,type=MemoryPool
+# java.lang:name=Survivor Space,type=MemoryPool
+# java.lang:name=Eden Space,type=MemoryPool
+#
+# To match all these values a search pattern is used:
+# P=java.lang:name=*Eden Space,type=MemoryPool will match both 'Par Eden Space' and 'PS Eden Space'
+# for Matching 'CMS Old Gen', 'PS Old Gen' and 'Tenured Gen' we use the following pattern:
+# P=(java.lang:name=*Old Gen,type=MemoryPool|java.lang:name=Tenured Gen,type=MemoryPool)
+
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_USED}->{mbean} = "P=java.lang:name=*Eden Space,type=MemoryPool";
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_USED}->{attribute} = "Usage";
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_USED}->{path} = "used";
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_USED}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_USED}->{unit} = "Mb";
+
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_MAX}->{mbean} = "P=java.lang:name=*Eden Space,type=MemoryPool";
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_MAX}->{attribute} = "Usage";
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_MAX}->{path} = "max";
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_MAX}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_mbean_metrics}->{MEMORY_EDEN_MAX}->{unit} = "Mb";
+
+# survivor
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_USED}->{mbean} = "P=java.lang:name=*Survivor Space,type=MemoryPool";
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_USED}->{attribute} = "Usage";
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_USED}->{path} = "used";
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_USED}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_USED}->{unit} = "Mb";
+
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_MAX}->{mbean} = "P=java.lang:name=*Survivor Space,type=MemoryPool";
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_MAX}->{attribute} = "Usage";
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_MAX}->{path} = "max";
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_MAX}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_mbean_metrics}->{MEMORY_SURVIVOR_MAX}->{unit} = "Mb";
+
+# oldgen
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_USED}->{mbean} = "P=(java.lang:name=*Old Gen,type=MemoryPool|java.lang:name=Tenured Gen,type=MemoryPool)";
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_USED}->{attribute} = "Usage";
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_USED}->{path} = "used";
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_USED}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_USED}->{unit} = "Mb";
+
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_MAX}->{mbean} = "P=(java.lang:name=*Old Gen,type=MemoryPool|java.lang:name=*Tenured Gen,type=MemoryPool)";
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_MAX}->{attribute} = "Usage";
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_MAX}->{path} = "max";
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_MAX}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_mbean_metrics}->{MEMORY_OLDGEN_MAX}->{unit} = "Mb";
+
+# permgen
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_USED}->{mbean} = "P=java.lang:name=*Perm Gen,type=MemoryPool";
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_USED}->{attribute} = "Usage";
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_USED}->{path} = "used";
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_USED}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_USED}->{unit} = "Mb";
+
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_MAX}->{mbean} = "P=java.lang:name=*Perm Gen,type=MemoryPool";
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_MAX}->{attribute} = "Usage";
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_MAX}->{path} = "max";
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_MAX}->{operation} = "/ 1024 / 1024";
+$services{memory}->{base_mbean_metrics}->{MEMORY_PERMGEN_MAX}->{unit} = "Mb";
+
+
+# extra (derived) metrics
+$services{memory}->{extra_metrics}->{USED_HEAP_PERCENT}->{expression} = "MEMORY_HEAP_USED / MEMORY_HEAP_MAX * 100";
+$services{memory}->{extra_metrics}->{USED_HEAP_PERCENT}->{operation} = "";
+$services{memory}->{extra_metrics}->{USED_HEAP_PERCENT}->{unit} = "%";
+
+$services{memory}->{extra_metrics}->{USED_NONHEAP_PERCENT}->{expression} = "MEMORY_NONHEAP_USED / MEMORY_NONHEAP_MAX * 100";
+$services{memory}->{extra_metrics}->{USED_NONHEAP_PERCENT}->{operation} = "";
+$services{memory}->{extra_metrics}->{USED_NONHEAP_PERCENT}->{unit} = "%";
+
+$services{memory}->{extra_metrics}->{USED_EDEN_PERCENT}->{expression} = "MEMORY_EDEN_USED / MEMORY_EDEN_MAX * 100";
+$services{memory}->{extra_metrics}->{USED_EDEN_PERCENT}->{operation} = "";
+$services{memory}->{extra_metrics}->{USED_EDEN_PERCENT}->{unit} = "%";
+
+$services{memory}->{extra_metrics}->{USED_SURVIVOR_PERCENT}->{expression} = "MEMORY_SURVIVOR_USED / MEMORY_SURVIVOR_MAX * 100";
+$services{memory}->{extra_metrics}->{USED_SURVIVOR_PERCENT}->{operation} = "";
+$services{memory}->{extra_metrics}->{USED_SURVIVOR_PERCENT}->{unit} = "%";
+
+$services{memory}->{extra_metrics}->{USED_OLDGEN_PERCENT}->{expression} = "MEMORY_OLDGEN_USED / MEMORY_OLDGEN_MAX * 100";
+$services{memory}->{extra_metrics}->{USED_OLDGEN_PERCENT}->{operation} = "";
+$services{memory}->{extra_metrics}->{USED_OLDGEN_PERCENT}->{unit} = "%";
+
+$services{memory}->{extra_metrics}->{USED_PERMGEN_PERCENT}->{expression} = "MEMORY_PERMGEN_USED / MEMORY_PERMGEN_MAX * 100";
+$services{memory}->{extra_metrics}->{USED_PERMGEN_PERCENT}->{operation} = "";
+$services{memory}->{extra_metrics}->{USED_PERMGEN_PERCENT}->{unit} = "%";
+#######################################################################################
+# file descriptors
+$services{file_descriptors}->{base_metrics}->{OS_FILE_DESC_OPEN}->{operation} = "";
+$services{file_descriptors}->{base_metrics}->{OS_FILE_DESC_MAX}->{operation} = "";
+
+$services{file_descriptors}->{extra_metrics}->{OS_FILE_DESC_USED_PERCENT}->{expression} = "OS_FILE_DESC_OPEN / OS_FILE_DESC_MAX * 100";
+$services{file_descriptors}->{extra_metrics}->{OS_FILE_DESC_USED_PERCENT}->{operation} = "";
+$services{file_descriptors}->{extra_metrics}->{OS_FILE_DESC_USED_PERCENT}->{unit} = "%";
+
+#######################################################################################
+# JVM Threads
+$services{threads}->{base_metrics}->{THREAD_COUNT}->{operation} = "";
+$services{threads}->{base_metrics}->{THREAD_COUNT_DAEMON}->{operation} = "";
+$services{threads}->{base_metrics}->{THREAD_COUNT_PEAK}->{operation} = "";
+$services{threads}->{base_metrics}->{THREAD_COUNT_STARTED}->{operation} = "";
+$services{threads}->{base_metrics}->{THREAD_COUNT_STARTED}->{unit} = "c";
+
+#######################################################################################
+# uptime
+$services{uptime}->{base_mbean_metrics}->{UPTIME}->{mbean} = "java.lang:type=Runtime";
+$services{uptime}->{base_mbean_metrics}->{UPTIME}->{attribute} = "Uptime";
+$services{uptime}->{base_mbean_metrics}->{UPTIME}->{path} = "";
+$services{uptime}->{base_mbean_metrics}->{UPTIME}->{operation} = "/ 1000 / 60 / 60";
+$services{uptime}->{base_mbean_metrics}->{UPTIME}->{unit} = "";
+
+#######################################################################################
+# GarbageCollection
+# metrics for the ParNew GC, this works on eden and survivor
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_DURATION}->{mbean} = "P=(java.lang:name=ParNew,type=GarbageCollector|java.lang:name=PS Scavenge,type=GarbageCollector|java.lang:name=Copy,type=GarbageCollector)";
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_DURATION}->{attribute} = "LastGcInfo";
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_DURATION}->{path} = "duration";
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_DURATION}->{operation} = "";
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_DURATION}->{unit} = "ms";
+
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_COLLECTIONCOUNT}->{mbean} = "P=(java.lang:name=ParNew,type=GarbageCollector|java.lang:name=PS Scavenge,type=GarbageCollector|java.lang:name=Copy,type=GarbageCollector)";
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_COLLECTIONCOUNT}->{attribute} = "CollectionCount";
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_COLLECTIONCOUNT}->{path} = "";
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_COLLECTIONCOUNT}->{operation} = "";
+$services{gc}->{base_mbean_metrics}->{GC_YOUNG_COLLECTIONCOUNT}->{unit} = "c";
+
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{mbean} = "P=(java.lang:name=ParNew,type=GarbageCollector|java.lang:name=PS Scavenge,type=GarbageCollector|java.lang:name=Copy,type=GarbageCollector)";
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{attribute} = "LastGcInfo";
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{path} = 'P=^(memoryUsageBeforeGc/Par Survivor Space/used|memoryUsageBeforeGc/PS Survivor Space/used|memoryUsageBeforeGc/Survivor Space/used)$';
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{operation} = "";
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_BEFORE_GC}->{unit} = "b";
+
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_AFTER_GC}->{mbean} = "P=(java.lang:name=ParNew,type=GarbageCollector|java.lang:name=PS Scavenge,type=GarbageCollector|java.lang:name=Copy,type=GarbageCollector)";
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_AFTER_GC}->{attribute} = "LastGcInfo";
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_AFTER_GC}->{path} = 'P=^(memoryUsageAfterGc/Par Survivor Space/used|memoryUsageAfterGc/PS Survivor Space/used|memoryUsageAfterGc/Survivor Space/used)$';
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_AFTER_GC}->{operation} = "";
+$services{gc}->{base_mbean_metrics}->{GC_SURVIVOR_AFTER_GC}->{unit} = "b";
+
+# metrics for ConcurrentMarkSweep
+# these are disabled, as for the inactive tomcat they are unknown
+#$services{gc}->{base_mbean_metrics}->{GC_TENURED_DURATION}->{mbean} = "java.lang:name=ConcurrentMarkSweep,type=GarbageCollector";
+#$services{gc}->{base_mbean_metrics}->{GC_TENURED_DURATION}->{attribute} = "LastGcInfo";
+#$services{gc}->{base_mbean_metrics}->{GC_TENURED_DURATION}->{path} = "duration";
+#$services{gc}->{base_mbean_metrics}->{GC_TENURED_DURATION}->{operation} = "";
+#$services{gc}->{base_mbean_metrics}->{GC_TENURED_DURATION}->{unit} = "ms";
+#
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONCOUNT}->{mbean} = "P=(java.lang:name=ConcurrentMarkSweep,type=GarbageCollector|java.lang:name=PS MarkSweep,type=GarbageCollector|java.lang:name=MarkSweepCompact,type=GarbageCollector)";
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONCOUNT}->{attribute} = "CollectionCount";
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONCOUNT}->{path} = "";
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONCOUNT}->{operation} = "";
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONCOUNT}->{unit} = "c";
+
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONTIME}->{mbean} = "P=(java.lang:name=ConcurrentMarkSweep,type=GarbageCollector|java.lang:name=PS MarkSweep,type=GarbageCollector|java.lang:name=MarkSweepCompact,type=GarbageCollector)";
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONTIME}->{attribute} = "CollectionTime";
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONTIME}->{path} = "";
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONTIME}->{operation} = "";
+$services{gc}->{base_mbean_metrics}->{GC_TENURED_COLLECTIONTIME}->{unit} = "c";
+
+$services{gc}->{extra_metrics}->{GC_TENURED_COLLECTIONTIME_NUMERICAL}->{expression} = "GC_TENURED_COLLECTIONTIME / H=DURATION - H=GC_TENURED_COLLECTIONTIME / H=DURATION";
+$services{gc}->{extra_metrics}->{GC_TENURED_COLLECTIONTIME_NUMERICAL}->{operation} = "";
+$services{gc}->{extra_metrics}->{GC_TENURED_COLLECTIONTIME_NUMERICAL}->{unit} = "ms";
+
+
+#
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_BEFORE_GC}->{mbean} = "java.lang:name=ConcurrentMarkSweep,type=GarbageCollector";
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_BEFORE_GC}->{attribute} = "LastGcInfo";
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_BEFORE_GC}->{path} = "memoryUsageBeforeGc/CMS Old Gen/used";
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_BEFORE_GC}->{operation} = "";
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_BEFORE_GC}->{unit} = "b";
+#
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_AFTER_GC}->{mbean} = "java.lang:name=ConcurrentMarkSweep,type=GarbageCollector";
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_AFTER_GC}->{attribute} = "LastGcInfo";
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_AFTER_GC}->{path} = "memoryUsageAfterGc/CMS Old Gen/used";
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_AFTER_GC}->{operation} = "";
+#$services{gc}->{base_mbean_metrics}->{GC_OLDGEN_AFTER_GC}->{unit} = "b";
+#
+#$services{gc}->{extra_metrics}->{GC_OLDGEN_FREED}->{expression} = "GC_OLDGEN_BEFORE_GC - GC_OLDGEN_AFTER_GC";
+#$services{gc}->{extra_metrics}->{GC_OLDGEN_FREED}->{operation} = "/ 1024 / 1024";
+#$services{gc}->{extra_metrics}->{GC_OLDGEN_FREED}->{unit} = "Mb";
+#
+
+
+#######################################################################################
+# tomcat sessions
+# FIXME: context must come from an argument!!
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{mbean} = "Catalina:context=%PARAM1%,host=localhost,type=Manager";
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{attribute} = "activeSessions";
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{path} = "";
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{operation} = "";
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_ACTIVE_SESSIONS}->{unit} = "";
+
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_CREATED_SESSIONS}->{mbean} = "Catalina:context=%PARAM1%,host=localhost,type=Manager";
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_CREATED_SESSIONS}->{attribute} = "sessionCounter";
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_CREATED_SESSIONS}->{path} = "";
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_CREATED_SESSIONS}->{operation} = "";
+$services{tomcat_sessions}->{base_mbean_metrics}->{TOMCAT_CREATED_SESSIONS}->{unit} = "c";
+
+#######################################################################################
+# tomcat threads
+# the name for this bean can vary: ajp-apr or ajp-bio, use PARAM1 to specify it
+# PARAM2 is the IP address, PARAM3 is the listening port
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_CURRENT}->{mbean} = 'Catalina:name="ajp-%PARAM1%-%PARAM2%-%PARAM3%",type=ThreadPool';
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_CURRENT}->{attribute} = "currentThreadCount";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_CURRENT}->{path} = "";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_CURRENT}->{operation} = "";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_CURRENT}->{unit} = "";
+
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_BUSY}->{mbean} = 'Catalina:name="ajp-%PARAM1%-%PARAM2%-%PARAM3%",type=ThreadPool';
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_BUSY}->{attribute} = "currentThreadsBusy";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_BUSY}->{path} = "";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_BUSY}->{operation} = "";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_BUSY}->{unit} = "";
+
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_MAX}->{mbean} = 'Catalina:name="ajp-%PARAM1%-%PARAM2%-%PARAM3%",type=ThreadPool';
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_MAX}->{attribute} = "maxThreads";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_MAX}->{path} = "";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_MAX}->{operation} = "";
+$services{tomcat_threads}->{base_mbean_metrics}->{TOMCAT_THREADS_MAX}->{unit} = "";
+
+$services{tomcat_threads}->{extra_metrics}->{TOMCAT_THREADS_BUSY_PERCENT}->{expression} = "TOMCAT_THREADS_BUSY * 100 / TOMCAT_THREADS_MAX";
+$services{tomcat_threads}->{extra_metrics}->{TOMCAT_THREADS_BUSY_PERCENT}->{operation} = "";
+$services{tomcat_threads}->{extra_metrics}->{TOMCAT_THREADS_BUSY_PERCENT}->{unit} = "%";
+
+# tomcat throughput
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_REQUEST_COUNT}->{mbean} = 'Catalina:name="ajp-%PARAM1%-%PARAM2%-%PARAM3%",type=GlobalRequestProcessor';
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_REQUEST_COUNT}->{attribute} = "requestCount";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_REQUEST_COUNT}->{path} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_REQUEST_COUNT}->{operation} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_REQUEST_COUNT}->{unit} = "c";
+
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_ERROR_COUNT}->{mbean} = 'Catalina:name="ajp-%PARAM1%-%PARAM2%-%PARAM3%",type=GlobalRequestProcessor';
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_ERROR_COUNT}->{attribute} = "errorCount";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_ERROR_COUNT}->{path} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_ERROR_COUNT}->{operation} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_ERROR_COUNT}->{unit} = "c";
+
+$services{tomcat_throughput}->{extra_metrics}->{TOMCAT_ERROR_RATE}->{expression} = "TOMCAT_ERROR_COUNT / TOMCAT_REQUEST_COUNT";
+$services{tomcat_throughput}->{extra_metrics}->{TOMCAT_ERROR_RATE}->{operation} = "";
+$services{tomcat_throughput}->{extra_metrics}->{TOMCAT_ERROR_RATE}->{unit} = "";
+
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_PROCESSING_TIME}->{mbean} = 'Catalina:name="ajp-%PARAM1%-%PARAM2%-%PARAM3%",type=GlobalRequestProcessor';
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_PROCESSING_TIME}->{attribute} = "processingTime";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_PROCESSING_TIME}->{path} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_PROCESSING_TIME}->{operation} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_PROCESSING_TIME}->{unit} = "ms";
+
+$services{tomcat_throughput}->{extra_metrics}->{TOMCAT_AVERAGE_PROCESSING_TIME}->{expression} = "TOMCAT_PROCESSING_TIME / TOMCAT_REQUEST_COUNT";
+$services{tomcat_throughput}->{extra_metrics}->{TOMCAT_AVERAGE_PROCESSING_TIME}->{operation} = "";
+$services{tomcat_throughput}->{extra_metrics}->{TOMCAT_AVERAGE_PROCESSING_TIME}->{unit} = "ms";
+
+# bytes received, BUT WITHOUT HEADERS -> this is only an approximation of the real bandwidth usage!
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_RECEIVED}->{mbean} = 'Catalina:name="ajp-%PARAM1%-%PARAM2%-%PARAM3%",type=GlobalRequestProcessor';
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_RECEIVED}->{attribute} = "bytesReceived";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_RECEIVED}->{path} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_RECEIVED}->{operation} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_RECEIVED}->{unit} = "c";
+
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_SENT}->{mbean} = 'Catalina:name="ajp-%PARAM1%-%PARAM2%-%PARAM3%",type=GlobalRequestProcessor';
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_SENT}->{attribute} = "bytesSent";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_SENT}->{path} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_SENT}->{operation} = "";
+$services{tomcat_throughput}->{base_mbean_metrics}->{TOMCAT_BYTES_SENT}->{unit} = "c";
+
+
+###############################################################################################################
+# Don't touch below this line
+###############################################################################################################
+
+my $check_name = "check_jmx";
+my $NAME = "CHECK_JMX";
+my $timeout = 10;
+
+my %STATES;
+$STATES{OK} = 0;
+$STATES{WARNING} = 1; 
+$STATES{CRITICAL} = 2;
+$STATES{UNKNOWN} = 3;
+
+&main();
+
+sub main {
+    my ($opt_h, $opt_u, $opt_p, $opt_j, $opt_s, @params, %provided_thresholds, $opts_t);
+    GetOptions ('help|h' => \$opt_h, 'user|u=s' => \$opt_u, 'password|p=s' => \$opt_p, 'jolokia_url|j=s' => \$opt_j, 'service|s=s' => \$opt_s,
+        'param=s' => \@params, 'threshold=s' => \%provided_thresholds, 'timeout|t=s' => \$opts_t);
+
+    if (defined $opt_h) {
+        &usage;
+        exit $STATES{UNKNOWN};
+    }
+
+    if (defined $opt_u) {
+        $user = $opt_u;
+    }
+    if (defined $opt_p) {
+        $password = $opt_p;
+    }
+
+    unless (defined $opt_j) {
+        print "UNKNOWN: Jolokia url has to be provided via the -j command line argument!\n";
+        &usage;
+        exit $STATES{UNKNOWN};
+    }
+
+    my $jolokia_url = $opt_j if defined $opt_j;
+    my $service;
+
+    if (defined $opt_s) {
+        # we're monitoring a complete service, like 'memory'
+        $service = $opt_s;
+        unless ((defined $services{$service}) && (defined $services{$service}->{base_metrics} || defined $services{$service}->{base_mbean_metrics})) {
+            print "UNKNOWN: No attributes for service '$service' were defined! Available services are: " . join(",", keys(%services)) . "\n";
+            exit $STATES{UNKNOWN};
+        }
+    } else {
+            &usage;
+            exit $STATES{UNKNOWN};
+    }
+
+    if (defined $opts_t && $opts_t) {
+        $timeout = $opts_t;
+    }
+
+    # check if the provided thresholds match anything
+    &check_threshold_names (\%provided_thresholds, \%services);
+
+    # iterate over the services hash, search and replace all placeholders to the real parameters
+    my $ref_services = &substitute_placeholders(\%services, \@params, $service);
+    %services = %{$ref_services};
+
+    # create a new jmx4perl object
+    my %values;
+    my %values_historical;
+    my %units;
+    my %thresholds;
+    my $jmx = JMX::Jmx4Perl->new(url => $jolokia_url, product => "tomcat", user => $user, password => $password, timeout => $timeout);
+
+    # test if we can reach jolokkia
+    eval { $jmx->info() };
+    if ($@) {
+	# there was an error connecting to jolokia
+	print "$NAME: CRITICAL: Unable to connect to Jolokia on $jolokia_url: $@!\n";
+	exit $STATES{CRITICAL};
+    }
+
+    if ($service) {
+        # FIXME: implement read func
+        my $ref_values_historical = &read_historical_data($service, $jolokia_url);
+        %values_historical = %{$ref_values_historical};
+        
+        # we're checking a complete service
+        # iterate over the base metrics
+        foreach my $base_metric (keys(%{$services{$service}->{base_metrics}})) {
+            if ((defined $services{$service}->{base_metrics}->{$base_metric}->{operation}) && ($services{$service}->{base_metrics}->{$base_metric}->{operation})) {
+                # if there's an operation defined, evaluate it on the value before storing it
+                $values{$base_metric} = eval (&evaluate_jmx_response($jmx->get_attribute($base_metric), undef, $base_metric) . " $services{$service}->{base_metrics}->{$base_metric}->{operation}") ;
+            } else {
+                # no operation, just simply get the attribute from JMX
+                $values{$base_metric} = &evaluate_jmx_response($jmx->get_attribute($base_metric), undef, $base_metric);
+            }
+            # store the given unit for this metric in %units
+            if (defined $services{$service}->{base_metrics}->{$base_metric}->{unit}) {
+               $units{$base_metric} = $services{$service}->{base_metrics}->{$base_metric}->{unit};
+            }
+
+            # check the thresholds
+            my ($ref_thresholds) = &check_thresholds($base_metric, $values{$base_metric}, \%thresholds, \%provided_thresholds,
+                            $services{$service}->{base_metrics}->{$base_metric}->{warning}, $services{$service}->{base_metrics}->{$base_metric}->{critical});
+            %thresholds = %{$ref_thresholds};
+        }
+
+        # get the metrics which are provided by mbeans - base_mbean_metrics
+        if (defined $services{$service}->{base_mbean_metrics}) {
+            # there are mbean metrics defined
+            foreach my $mbean_alias (keys(%{$services{$service}->{base_mbean_metrics}})) {
+                # get the alias for this mbean
+                my $attribute;
+                if ((defined $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{attribute}) && ($services{$service}->{base_mbean_metrics}->{$mbean_alias}->{attribute})) {
+                    $attribute= $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{attribute};
+                } else {
+                    # no alias was provided, exit with unknown
+                    print "$NAME: UNKNOWN: No attribute was specified for the mbean with alias '$mbean_alias'. Please specify the attribute!\n";
+                    exit $STATES{UNKNOWN};
+                }
+                # get the path for this mbean, or leave it empty if it wasn't defined
+                my $path = "";
+                if ((defined $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{path}) && $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{path}) {
+                    $path = $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{path};
+                }
+                # check if the mbean is a pattern on a specific mbean
+                my $ref_mbean_result;
+                my $mbean_result = "";
+                if ($services{$service}->{base_mbean_metrics}->{$mbean_alias}->{mbean} =~ /^P=\(?([^\(\)]+)\)?$/) {
+                    # it's a search pattern, we need to search for the full name of the mbean before getting it's value
+                    my @mbean_pattern = split(/\|/, $1);
+                    # iterate over the patterns, check if they have a result
+                    foreach my $mbean_pattern (@mbean_pattern) {
+                        $ref_mbean_result = $jmx->search($mbean_pattern);
+                        if ((!defined $ref_mbean_result) || (scalar @{$ref_mbean_result} == 0)) {
+                            # no result was found for this pattern, move on to the next (if provided)
+                            next;
+                        } elsif (scalar @{$ref_mbean_result} > 1) {
+                            # multiple results
+                            $mbean_result = scalar @{$ref_mbean_result};
+                            last;
+                        }
+                        # we're good, save the found mbean name
+                        $mbean_result = pop(@{$ref_mbean_result});
+                    }
+                    # handle errors
+                    if ($mbean_result =~ /^[0-9]+$/) {
+                        printf "$NAME: UNKNOWN: %d attributes was found that matches the mbean search pattern '%s' (metric $mbean_alias). You need to refine your search pattern.\n", $mbean_result, join("|", @mbean_pattern);
+                        exit $STATES{UNKNOWN};
+                    }
+                    unless ($mbean_result) {
+                        printf "$NAME: UNKNOWN: No attribute was found that would match the mbean search pattern '%s' (metric $mbean_alias). You need to refine your search pattern.\n", join("|", @mbean_pattern);
+                        exit $STATES{UNKNOWN};
+                    } else {
+                        # we're good to go
+                        $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{mbean} = $mbean_result;
+                    }
+                }
+                my $jmx_request = new JMX::Jmx4Perl::Request({type => 'read',
+                                            mbean => $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{mbean},
+                                            attribute => $attribute});
+                                            #path => $path});
+                if ((defined $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{operation}) && ($services{$service}->{base_mbean_metrics}->{$mbean_alias}->{operation})) {
+                	# if there's an operation defined, evaluate it on the value before storing it
+                	$values{$mbean_alias} = eval (&evaluate_jmx_response($jmx->request($jmx_request)->value(), $path, $mbean_alias) . " $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{operation}") ;
+                } else {
+                    # no operation, just simply get the attribute from JMX
+                    $values{$mbean_alias} = &evaluate_jmx_response($jmx->request($jmx_request)->value(), $path, $mbean_alias);
+                }
+                # store the given unit for this metric in %units
+                if (defined $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{unit}) {
+                    $units{$mbean_alias} = $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{unit};
+                }
+    
+                # check the thresholds
+                my ($ref_thresholds) = &check_thresholds($mbean_alias, $values{$mbean_alias}, \%thresholds, \%provided_thresholds,
+                                $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{warning}, $services{$service}->{base_mbean_metrics}->{$mbean_alias}->{critical});
+                %thresholds = %{$ref_thresholds};
+
+            }
+        }
+
+        # create the derived metrics - these are derived from the base metrics
+        if (defined $services{$service}->{extra_metrics}) {
+            # there are extra metrics defined
+            foreach my $extra_metric (keys(%{$services{$service}->{extra_metrics}})) {
+                # iterate, iterate
+                # evaluate the expression and get the derived value, then store it
+                $values{$extra_metric} = &evaluate_expression ($services{$service}->{extra_metrics}->{$extra_metric}->{expression}, \%values, \%values_historical);
+                if ((defined $services{$service}->{extra_metrics}->{$extra_metric}->{operation}) && ($services{$service}->{extra_metrics}->{$extra_metric}->{operation})) {
+                    # if there's an operation, do that also
+                    $values{$extra_metric} = eval ("$values{$extra_metric} $services{$service}->{extra_metrics}->{$extra_metric}->{operation}");
+                }
+                # store the unit
+                $units{$extra_metric} = $services{$service}->{extra_metrics}->{$extra_metric}->{unit};
+
+                # check the thresholds
+                my ($ref_thresholds) = &check_thresholds($extra_metric, $values{$extra_metric}, \%thresholds, \%provided_thresholds,
+                                $services{$service}->{extra_metrics}->{$extra_metric}->{warning}, $services{$service}->{extra_metrics}->{$extra_metric}->{critical});
+                %thresholds = %{$ref_thresholds};
+            }
+        }
+
+        # FIXME: write out data
+        &write_values_to_disk(\%values, $service, $jolokia_url);
+
+        # assemble the performance data
+        my $perfdata;
+        foreach my $metric (sort(keys(%values))) {
+            if (defined $units{$metric}) {
+                # each data must be printed differently, based on the unit (c - integer, % - float, etc)
+                # FIXME: known 'bug': if a threshold is 0, it won't be printed as a limit for the performance data, because of the '$thresholds{$metric}->{warning} ?' construct, where the given treshold for 0 is counted as "false"
+                if ($units{$metric} eq "%") {
+                    # percentage can be a float
+                    $perfdata .= sprintf ("%s=%0.2f%s;%s;%s;0;100 ", lc($metric), $values{$metric}, $units{$metric}, $thresholds{$metric}->{warning} ? $thresholds{$metric}->{warning} : "", $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "");
+                } elsif ($units{$metric} eq "c") {
+                    # counter must be an integer
+                    $perfdata .= sprintf ("%s=%d%s;%s;%s ", lc($metric), int($values{$metric}), $units{$metric}, $thresholds{$metric}->{warning} ? $thresholds{$metric}->{warning} : "", $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "");
+                } else {
+                    # all other can go as float
+                    $perfdata .= sprintf ("%s=%0.2f%s;%s;%s ", lc($metric), $values{$metric}, $units{$metric}, $thresholds{$metric}->{warning} ? $thresholds{$metric}->{warning} : "", $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "");
+                }
+            } else {
+                # if the value doesn't have a unit, print it as an integer
+                $perfdata .= sprintf ("%s=%0d;%s;%s ", lc($metric), $values{$metric}, $thresholds{$metric}->{warning} ? $thresholds{$metric}->{warning} : "", $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "" );
+            }
+        }
+        my %warnings;
+        my %criticals;
+        foreach my $metric (sort(keys(%thresholds))) {
+            if ($thresholds{$metric}->{is_warning}) {
+                    $warnings{$metric} = $thresholds{$metric}->{warning};
+            }
+            if ($thresholds{$metric}->{is_critical}) {
+                    $criticals{$metric} = $thresholds{$metric}->{critical};
+            }
+        }
+
+        my $state_name;
+        my $message;
+        if (scalar keys(%criticals) > 0) {
+            $state_name = "CRITICAL";
+            $message = "$NAME: $state_name: The following JMX metrics are in critical state:";
+            foreach my $metric (keys(%criticals)) {
+                $message .= sprintf (" %s=%0.2f%s (w:%s c:%s),", lc($metric),$values{$metric}, $units{$metric} ? $units{$metric} : "", $thresholds{$metric}->{warning}, $thresholds{$metric}->{critical});
+            }
+            # remove trailing comma
+            chop ($message);
+        } elsif (scalar keys(%warnings) > 0) {
+            $state_name = "WARNING";
+            $message = "$NAME: $state_name: The following JMX metrics are in warning state:";
+            foreach my $metric (keys(%warnings)) {
+                $message .= sprintf (" %s=%0.2f%s (w:%s c:%s),", lc($metric),$values{$metric}, $units{$metric} ? $units{$metric} : "", $thresholds{$metric}->{warning}, $thresholds{$metric}->{critical} ? $thresholds{$metric}->{critical} : "N/A");
+            }
+            chop ($message);
+        } else {
+            $state_name = "OK";
+            $message = "$NAME $state_name: All JMX metrics are ok.";
+        }
+        my $state = $STATES{$state_name};
+        &print_status_and_exit ($state_name, $state, $message, $perfdata)
+
+    }
+}
+
+
+################################################################
+
+sub usage () {
+    print "Usage: $0 -j jolokia_url  <-t type -b bean_name -a attribute | -s attribute_alias > [-w warning] [-c critical] [-u user] [-p password]\n";
+}
+
+# subroutine to evaluate an expression
+# $expression holds key names, $ref_data is a hash having keys
+# The expression is evaluated using eval(), and for this for each element of $expression there must be a matching key in $ref_data
+# The result is returned in the end
+sub evaluate_expression ($$$) {
+    my $expression = shift;
+    my $ref_data = shift;
+    my %data = %{$ref_data};
+    my $ref_data_historical = shift;
+    my %data_historical = %{$ref_data_historical};
+    # search and replace expression MEMORY_HEAP_MAX -> $data{MEMORY_HEAP_MAX}
+    # remove spaces in the expression
+    $expression =~ s/ //g;
+    # split the expression based on the operators
+    my @operands = split(/[+*\/-]/, $expression);
+    # check if we have values for the given aliases
+    foreach my $operand (@operands) {
+        # constants should not be taken into account (* 100 for example)
+        next if $operand =~ /^[0-9]+$/;
+        if ($operand =~ /^H=/) {
+            # we need historical data
+            # remove the H= from the beginning
+            $operand =~ s/^H=//;
+            #print "debug: operand is ${operand}\n";
+            unless (defined $data_historical{$operand}) {
+            	# historical data doesn't exist, most likely this is the first run afte reboot
+            	print STDERR "Historical data for operand '$operand' was not found in the hash holding the metric names and values!\n";
+            } else {
+	            # do a search and replace, change the alias names to the actual variable names
+	            # THIS IS UGLY! Unfortunately I have no better idea how to do it...
+	            $expression =~ s/H=${operand}/\$data_historical{$operand}/;
+           	}
+        } else {
+            unless (defined $data{$operand}) {
+                print "$NAME: UNKNOWN: Operand '$operand' was not found in the hash holding the metric names and values!\n";
+                exit $STATES{UNKNOWN};
+            }
+            # do a search and replace, change the alias names to the actual variable names
+            # THIS IS UGLY! Unfortunately I have no better idea how to do it...
+            $expression =~ s/$operand/\$data{$operand}/;
+        }
+    }
+    my $e = eval($expression);
+    unless (defined($e)) {
+    	print STDERR "There was a problem while evaluating expression '$expression': $@\n";
+    }
+    # return with the evaluated expression
+    return $e;
+}
+
+sub print_status_and_exit ($$$$) {
+    my $state_name = shift;
+    my $state = shift;
+    my $message = shift;
+    my $perfdata = shift;
+    print ("$message | $perfdata\n");
+    exit $state;
+
+}
+
+sub check_thresholds ($$$$$) {
+    my $metric = shift;
+    my $value = shift;
+    my $ref_thresholds = shift;
+    my $ref_provided_thresholds = shift;
+    my $warning = shift;
+    my $critical = shift;
+    my %thresholds = %{$ref_thresholds};
+    my %provided_thresholds = %{$ref_provided_thresholds};
+    # use the threshold levels provided via the command line 
+    my @th;
+    if (defined $provided_thresholds{lc($metric)} && $provided_thresholds{lc($metric)}) {
+        # split up the string to warning and critical thresholds
+        @th = split(/[:,]/, $provided_thresholds{lc($metric)});
+    } elsif (defined $provided_thresholds{uc($metric)} && $provided_thresholds{uc($metric)}) {
+        @th = split(/[:,]/, $provided_thresholds{uc($metric)});
+    }
+    if (scalar @th) {
+            $warning = $th[0];
+        if ($th[1]) {
+            $critical = $th[1];
+        }
+    }
+    if (defined $warning) {
+        $thresholds{$metric}->{warning} = $warning;
+        if (defined $critical && ($value < $critical) && ($value > $warning)) {
+            $thresholds{$metric}->{is_warning} = 1;
+        } elsif ($value > $warning) {
+            $thresholds{$metric}->{is_warning} = 1;
+        }
+    }
+    if (defined $critical) {
+        $thresholds{$metric}->{critical} = $critical;
+        if ($value > $critical) {
+            $thresholds{$metric}->{is_critical} = 1;
+        }
+    }
+    return \%thresholds;
+}
+
+sub substitute_placeholders ($$) {
+    my $ref_services = shift;
+    my $ref_params = shift;
+    my $service = shift;
+    my %services = %{$ref_services};
+    my @params = @{$ref_params};
+    foreach my $metric (keys(%{$services{$service}})) {
+        foreach my $name (keys(%{$services{$service}->{$metric}})) {
+            foreach my $attribute (keys(%{$services{$service}->{$metric}->{$name}})) {
+                if (($services{$service}->{$metric}->{$name}->{$attribute} =~ /%PARAM[0-9]%/) && (! scalar @params)) {
+                    print "$NAME: UNKNOWN: The metric $service/$metric/$name/$attribute uses a parameter, however you haven't specified the parameter on the command line.\n";
+                    exit 3;
+                }
+                my $index = 1;
+                foreach my $parameter (@params) {
+                    $services{$service}->{$metric}->{$name}->{$attribute} =~ s/%PARAM${index}%/$parameter/g;
+                    $index++;
+                }
+            }
+        }
+    }
+    return \%services;
+}
+
+sub check_threshold_names ($$) {
+    my $ref_thresholds = shift;
+    my $ref_services = shift;
+    my %thresholds = %{$ref_thresholds};
+    my %services = %{$ref_services};
+    my %found;
+    foreach my $th (keys(%thresholds)) {
+        foreach my $service (keys(%services)) {
+            foreach my $metric (keys(%{$services{$service}})) {
+                foreach my $name (keys(%{$services{$service}->{$metric}})) {
+                    if (lc($name) eq lc($th)) {
+                        $found{$th} = 1;
+                    }
+                }
+            }
+        }
+    }
+    # get the keys which were not present
+    my @diff  = grep {not $found{$_}} keys %thresholds;
+    if (scalar @diff) {
+        # can't find at least one metric for a given threshold
+        print "$NAME: UNKNOWN: Can't find a matching metric for the following thresholds: " . join (",", @diff) . "\n";
+        exit 3;
+    }
+}
+
+sub evaluate_jmx_response ($$$) {
+    my $response = shift;
+    my $path = shift;
+    my $metric_name = shift;
+
+    my $value;
+
+    if ($response =~ /^Can't connect to/) {
+        # there was a timeout
+        print "$NAME: CRITICAL: Timeout while trying to connect to the Jolokia service.\n";
+        exit 2;
+    }
+    # check if the response is a hash, if yes, look into it to get the value for the given path we have
+	if (ref($response) eq "HASH") {
+		unless (defined($path)) {
+			# problem, no path provided but is a hash
+			print "$NAME: UNKNOWN: The result is a hash of metrics, but path was not given (mbean: $metric_name)!\n";
+			exit 3;
+		} else {
+			# path provided, good, get the subhash
+			$value = &find_value_for_path_pattern($response, $path, $metric_name);
+		}
+	} else {
+		# only a scalar value, return it without doing anything further, path is not needed
+		$value = $response;
+	}
+    return $value;
+}
+
+# match a given hash to a given path using Hash::Flatten to find the needed values
+sub find_value_for_path_pattern ($$) {
+	my $ref_data = shift;
+	my %data = %{$ref_data};
+	my $path = shift;
+	my $metric_name = shift;
+
+	my $path_pattern;
+	my $value;
+
+	if ($path =~ /^P=(.*)$/) {
+		# path is in fact a pattern
+		$path_pattern = $1;
+	} else {
+		# not a pattern, but make it a pattern
+		$path_pattern = sprintf('^%s$', $path);
+	}
+
+	# flatten the hash so we can do a regex search on the key names
+	my $o = new Hash::Flatten({
+			HashDelimiter => "/",
+			ArrayDelimiter => ",",
+			OnRefScalar => "warn",
+		});
+	my $flat_hash = $o->flatten($ref_data);
+	my %flat_hash = %{$flat_hash};
+	my @result_paths;
+	foreach my $p (keys(%flat_hash)) {
+		if ($p =~ /$path_pattern/) {
+			push (@result_paths, $p);
+		}
+	}
+	if (length(@result_paths) > 1) {
+		# too many results
+		printf "$NAME: UNKNOWN: Too many paths found that are matching the given pattern for path '%s' <=> '%s' for metric '%s'\n", $path_pattern, join(",", @result_paths), $metric_name;
+		exit 3;
+	} elsif (length(@result_paths) < 1) {
+		# no result
+		printf "$NAME: UNKNOWN: No paths were found that are matching the given pattern for path '%s' for metric '%s'\n:", $path_pattern, $metric_name;
+		exit 3;
+	} else {
+		# good, get the value for the given path
+		my $path = pop(@result_paths);
+		$value = $flat_hash{$path};
+	}
+	return $value;
+}
+
+sub write_values_to_disk($$$) {
+	my $ref_values = shift;
+	my %values = %{$ref_values};
+	my $service = shift;
+	my $jolokia_url = shift;
+	# get the timestamp
+	my $timestamp = time();
+	# determine the filename
+	my $historical_data_file = $historical_data_file_pattern;
+	$historical_data_file =~ s/%SERVICE%/$service/g;
+	# flatten the jolokia url and use it as %JOLOKIA_URL% (to allow instance a/b on one machine)
+	my $jolokia_url_flat = $jolokia_url;
+	$jolokia_url_flat =~ s#http://##g;
+	$jolokia_url_flat =~ s/[^a-zA-Z0-9]/_/g;
+	$historical_data_file =~ s/%JOLOKIA_URL%/$jolokia_url_flat/;
+
+	# write out the data
+	open (HISTFILE, ">${historical_data_file}") or die "Can't open data file $historical_data_file for writing: $!";
+	foreach my $metric (keys(%values)) {
+		if ($values{$metric}) { # there can be cases where the cumulated metrics are not yet available
+			print HISTFILE "$timestamp $metric $values{$metric}\n";
+		}
+	}
+	close(HISTFILE);
+}
+
+sub read_historical_data($$) {
+	my $service = shift;
+	my $jolokia_url = shift;
+	my %data;
+	my $timestamp;
+
+	# determine the data filename
+	my $historical_data_file = $historical_data_file_pattern;
+	$historical_data_file =~ s/%SERVICE%/$service/g;
+	# flatten the jolokia url and use it as %JOLOKIA_URL% (to allow instance a/b on one machine)
+	my $jolokia_url_flat = $jolokia_url;
+	$jolokia_url_flat =~ s#http://##g;
+	$jolokia_url_flat =~ s/[^a-zA-Z0-9]/_/g;
+	$historical_data_file =~ s/%JOLOKIA_URL%/$jolokia_url_flat/;
+
+	if (-f $historical_data_file) {
+		# read the file, put the values into a hash
+		open (HISTFILE, $historical_data_file) or die "Can't open the data file '$historical_data_file' containing the historical data: $!";
+		while (<HISTFILE>) {
+			my $line = $_;
+			chomp($line);
+			next unless ($line =~ /^([0-9]+) ([^\s]+) ([^\s]+)$/);
+			$data{$2} = $3; 
+			$timestamp = $1;
+		}
+		close(HISTFILE);
+		# put the timestamp into the values hash as one extra key
+		$data{"DURATION"} = time() - $timestamp;
+	} else {
+		# the file doesn't exist yet
+	}
+	return \%data;
+}

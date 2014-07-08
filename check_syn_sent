@@ -1,0 +1,151 @@
+#!/bin/bash
+#DESC checks the number of connections that are in the SYN_SENT state
+
+# what mode to run in?
+# cgi: cgi for running using survey
+# nrpe: run as a nagios nrpe check
+# check_mk: run as a check_mk agent script
+MODE="nrpe"
+
+PROGNAME=`/usr/bin/basename $0`
+NAME="CONN_SYN_SENT"
+DEBUG=0
+CMD_BINARY="/bin/netstat"
+CMD_ARGS="-n --inet"
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+
+# function to print messages and exit with a pre-defined exit code
+# that matches the requirement of the given runmode
+function print_message_and_exit () {
+	mode=$1
+	name=$2
+	progname=$3
+	status_name=$4
+	exit_code=$5
+	message=$6
+	performance_data=$7
+	if [ $DEBUG -eq 1 ] ; then
+		echo "mode: $mode"
+		echo "name: $name"
+		echo "prg: $progname"
+		echo "status: $status_name"
+		echo "exit: $exit_code"
+		echo "msg: $message"
+		echo "perdata: $performance_data"
+	fi
+	case $MODE in
+		nrpe)
+            # performance data in the nagios compatible mode may not contain pipes, only spaces
+			nrpe_performance_data=$(echo $performance_data | sed -e 's/|/ /g')
+            if [[ ! -z $nrpe_performance_data ]] ; then
+                # only output performance data if there's one provided
+    			echo "$name $status_name: $message | $nrpe_performance_data"
+            else
+                echo "$name $status_name: $message"
+            fi
+			exit $exit_code
+			;;
+		cgi)
+			echo "Content-Type: text/plain"
+			echo ""
+			echo "$name $status_name - $message"
+			exit 1
+			;;
+		check_mk)
+			echo "$exit_code $progname $performance_data $name: $status_name: $message"
+			exit $exit_code
+			;;
+		*)	
+			echo "Unknown MODE was provided; exiting."
+			exit 3
+			;;
+	esac
+}
+
+# check if the command we'll use actually exists
+function check_command_exists () {
+   if [ ! -e $CMD_BINARY ] ; then
+      print_message_and_exit $MODE $NAME $PROGNAME "UNKNOWN"  "3"  "$CMD_BINARY doesn't exist!"  ""
+   fi
+}
+
+# print the usage
+function usage () {
+cat << EOF
+Usage: $0 -w warning -c critical
+Example: $0 -w 300 -c 500
+
+This script will check the number of opened files for a given user provided by the -u argument.
+
+Options:
+    -h      Show this message
+    -w      The number of open files to be considered as warning
+    -c      The number of open files to be considered as critical
+    -d      Debug output
+EOF
+}
+
+######################
+# MAIN
+######################
+
+# check if the lsof command exists
+check_command_exists
+# get the arguments
+while getopts "hdw:c:" OPTION ; do
+    case $OPTION in
+        h|\?)
+                usage
+                exit $STATE_UNKNOWN
+                ;;
+        w)
+                warning=$OPTARG
+                ;;
+        c)
+                critical=$OPTARG
+                ;;
+        d)
+                DEBUG=1
+                ;;       
+    esac
+done
+
+# both warning and critical levels must be provided
+if [[ -z $warning ]] || [[ -z $critical ]]; then
+    usage
+    exit $STATE_UNKNOWN
+fi
+
+syn_count=$($CMD_BINARY $CMD_ARGS | grep SYN_SENT | wc -l)
+
+if [ $syn_count -lt $warning ] ; then
+    state=$STATE_OK
+    state_name="OK"
+else 
+    if [ $syn_count -gt $critical ] ; then
+        state=$STATE_CRITICAL
+        state_name="CRITICAL"
+    else 
+        if [ $syn_count -gt $warning ] ; then
+            state=$STATE_WARNING
+            state_name="WARNING"
+        fi
+    fi
+fi
+
+# get the top 5 hosts where syn_sent connections are sent
+# No, I'm not proud of this. You say should've created the whole script in perl in the first place? Maybe.
+# Or maybe I just need to learn write proper bash code. Oh well, for now, it stays like this.
+# Get the netstat output, look for SYN_SENT state, get the target IP, sort and get the unique ones, count them, do a reverse DNS lookup on the IP addresses, and output the list
+hosts=$(netstat -n -4|grep SYN_SENT|awk '{print $5}'|cut -d: -f1|sort -n |uniq -c|sort -rn|head -n 10|perl -MSocket -lane 'printf ("%s:%s ", scalar gethostbyaddr(inet_aton($F[1]), AF_INET),$F[0])')
+
+if [[ -z $hosts ]] ; then
+    hosts="N/A"
+fi
+
+print_message_and_exit $MODE $NAME $PROGNAME $state_name $state "Number of connections in the SYN_SENT state is $syn_count. (Hosts: $hosts) (w:${warning}, c:${critical})" "syn_sent=$syn_count;$warning;$critical"
+
+
